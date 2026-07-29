@@ -716,3 +716,139 @@ fn recv_transport_error_ipv6() {
         assert_eq!(addr.ip(), dst.ip());
     }
 }
+
+/// Verifies that a pending ICMP error in the Linux error queue does not absorb
+/// an unrelated later `sendmsg` call.
+///
+/// Without the retry in `send()`, the second send may fail with the pending
+/// socket error from the earlier transmission and the payload never reaches the
+/// valid receiver.
+#[test]
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn pending_icmp_error_does_not_absorb_unrelated_send() {
+    let sock = Socket::from(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap());
+    let state = UdpSocketState::new((&sock).into()).unwrap();
+
+    // Enqueue an ICMP port-unreachable error by sending to an unused local port.
+    let unused_port = {
+        let tmp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        tmp.local_addr().unwrap().port()
+    };
+    let bad_dst = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, unused_port));
+    state
+        .try_send(
+            (&sock).into(),
+            &Transmit {
+                destination: bad_dst,
+                ecn: None,
+                contents: b"trigger",
+                segment_size: None,
+                src_ip: None,
+            },
+        )
+        .unwrap();
+
+    // Give the kernel time to enqueue the asynchronous error without draining it.
+    std::thread::sleep(Duration::from_millis(20));
+
+    let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    receiver.set_nonblocking(true).unwrap();
+
+    state
+        .try_send(
+            (&sock).into(),
+            &Transmit {
+                destination: receiver.local_addr().unwrap(),
+                ecn: None,
+                contents: b"connection close",
+                segment_size: None,
+                src_ip: None,
+            },
+        )
+        .expect("send was absorbed by an unrelated queued ICMP error");
+
+    std::thread::sleep(Duration::from_millis(20));
+
+    let mut buf = [0u8; 64];
+    let n = receiver
+        .recv(&mut buf)
+        .expect("packet was silently absorbed by the error queue");
+    assert_eq!(&buf[..n], b"connection close");
+}
+
+/// Verifies that retrying a send after a queued socket error does not consume
+/// the corresponding MSG_ERRQUEUE entries.
+///
+/// In this setup, multiple queued ICMP errors still allow a later valid send to
+/// succeed, and all queued transport errors remain retrievable via
+/// `recv_transport_error()`.
+#[test]
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn queued_icmp_errors_survive_send_retry() {
+    let sock = Socket::from(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap());
+    let state = UdpSocketState::new((&sock).into()).unwrap();
+
+    // Enqueue 3 ICMP port-unreachable errors
+    for _ in 0..3 {
+        let unused_port = {
+            let tmp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            tmp.local_addr().unwrap().port()
+        };
+        state
+            .try_send(
+                (&sock).into(),
+                &Transmit {
+                    destination: SocketAddr::V4(SocketAddrV4::new(
+                        Ipv4Addr::LOCALHOST,
+                        unused_port,
+                    )),
+                    ecn: None,
+                    contents: b"trigger",
+                    segment_size: None,
+                    src_ip: None,
+                },
+            )
+            .unwrap();
+    }
+
+    std::thread::sleep(Duration::from_millis(50));
+
+    // Send to a real receiver without draining the error queue first
+    let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    receiver.set_nonblocking(true).unwrap();
+
+    state
+        .try_send(
+            (&sock).into(),
+            &Transmit {
+                destination: receiver.local_addr().unwrap(),
+                ecn: None,
+                contents: b"connection close",
+                segment_size: None,
+                src_ip: None,
+            },
+        )
+        .expect("send was absorbed by queued ICMP error");
+
+    std::thread::sleep(Duration::from_millis(20));
+
+    // Verify the packet actually arrived
+    let mut buf = [0u8; 64];
+    let n = receiver
+        .recv(&mut buf)
+        .expect("packet was silently dropped");
+    assert_eq!(&buf[..n], b"connection close");
+
+    // Verify all 3 errors are still retrievable
+    let mut count = 0;
+    for _ in 0..10 {
+        match state.recv_transport_error((&sock).into()) {
+            Ok(Some(_)) => count += 1,
+            _ => break,
+        }
+    }
+    assert_eq!(
+        count, 3,
+        "expected all 3 queued errors to survive the retry"
+    );
+}

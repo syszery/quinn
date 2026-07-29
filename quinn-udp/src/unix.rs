@@ -309,6 +309,9 @@ impl UdpSocketState {
     /// (`MSG_ERRQUEUE`). Returns `None` if the queue is empty or if the
     /// underlying platform is unsupported.
     ///
+    /// These errors are reported out-of-band by the kernel and may also affect
+    /// subsequent socket operations before they are retrieved explicitly.
+    ///
     /// Returns an error if the underlying system call fails unexpectedly.
     pub fn recv_transport_error(
         &self,
@@ -504,6 +507,9 @@ fn send(
         state.sendmsg_einval(),
     );
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let mut retried_after_async_error = false;
+
     loop {
         let n = unsafe { libc::sendmsg(io.as_raw_fd(), &msg_hdr, 0) };
 
@@ -548,6 +554,17 @@ fn send(
                         state.sendmsg_einval(),
                     );
                     continue;
+                }
+
+                // On Linux, a queued asynchronous transport error may be reported from
+                // a later sendmsg() call, even if it originated from an earlier packet.
+                // Retry once so unrelated queued errors do not absorb this transmit.
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                {
+                    if !retried_after_async_error {
+                        retried_after_async_error = true;
+                        continue;
+                    }
                 }
 
                 return Err(e);
